@@ -27,25 +27,19 @@ double Sensor_AS5600::getSensorAngle() {
 bool Sensor_AS5600::readSensorAngle(float& angle) {
   if (wire == nullptr) return false;
 
-  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+  // 只做两次快速尝试，且每次I2C超时1ms：
+  // 60rad/s附近电机振动会让AS5600偶发NACK，旧代码每次重试可能阻塞10ms，
+  // 控制周期被拉长后表现为“串口卡顿/速度乱摆”。宁可这一拍丢角度，也不能阻塞控制环。
+  for (uint8_t attempt = 0; attempt < 2; attempt++) {
     bool ok = false;
 
-    if (attempt < 2) {
-      // 先写寄存器地址（STOP），再单独发起读事务。
-      // 这样避开ESP32 Wire库的 i2cWriteReadNonStop（重复起始）在电机PWM干扰下
-      // 容易返回 Error -1 / 263 的问题；AS5600的寄存器指针在STOP后仍然保持。
-      wire->beginTransmission(AS5600_ADDR);
-      wire->write((uint8_t)AS5600_ANGLE_REG);
-      if (wire->endTransmission(true) == 0) {
-        ok = (wire->requestFrom((uint8_t)AS5600_ADDR, (uint8_t)2) == 2);
-      }
-    } else {
-      // 最后一次兼容标准重复起始时序
-      wire->beginTransmission(AS5600_ADDR);
-      wire->write((uint8_t)AS5600_ANGLE_REG);
-      if (wire->endTransmission(false) == 0) {
-        ok = (wire->requestFrom((uint8_t)AS5600_ADDR, (uint8_t)2) == 2);
-      }
+    // 先写寄存器地址（STOP），再单独发起读事务。
+    // 这样避开ESP32 Wire库的 i2cWriteReadNonStop（重复起始）在电机PWM干扰下
+    // 容易返回 Error -1 / 263 的问题；AS5600的寄存器指针在STOP后仍然保持。
+    wire->beginTransmission(AS5600_ADDR);
+    wire->write((uint8_t)AS5600_ANGLE_REG);
+    if (wire->endTransmission(true) == 0) {
+      ok = (wire->requestFrom((uint8_t)AS5600_ADDR, (uint8_t)2) == 2);
     }
 
     if (ok) {
@@ -61,7 +55,7 @@ bool Sensor_AS5600::readSensorAngle(float& angle) {
     // 清掉可能残留的数据，计数并重试
     while (wire->available()) wire->read();
     i2c_error_count++;
-    delayMicroseconds(100);
+    delayMicroseconds(50);
   }
 
   i2c_fail_count++;
@@ -78,7 +72,7 @@ Sensor_AS5600::Sensor_AS5600(int Mot_Num) {
 void Sensor_AS5600::Sensor_init(TwoWire* _wire) {
     wire=_wire;
     wire->begin();   //已经显式启动的总线会保持原有引脚配置
-    wire->setTimeOut(10);  //避免总线异常时阻塞50ms
+    wire->setTimeOut(1);  //1ms；总线异常时绝不允许长时间阻塞控制环
     delay(500);
 
     float initial_angle;
@@ -123,13 +117,37 @@ bool Sensor_AS5600::Sensor_update() {
 
     consecutive_failures = 0;
     sensor_ready = true;
-    last_sensor_angle = val;
-    angle_prev_ts = micros();
-    float d_angle = val - angle_prev;
+
+    uint32_t now = micros();
+    float dt = (now - angle_prev_ts) * 1e-6f;
+    if (dt <= 0.0f) dt = 1e-3f;
+
+    // 角度跳变检查：AS5600 偶尔会在PWM干扰下读到一个“成功”但错误的角度。
+    // 真实机械角速度不会超过约120rad/s，单次采样内角度变化超过 120*dt 就丢弃；
+    // 否则会被当成一圈跳变，速度瞬间出现 ±200/585 这种尖峰，并让电流环打出冲击。
+    float d_raw = val - angle_prev;
+    float d_unwrapped = d_raw;
+    if (d_unwrapped > (float)PI) d_unwrapped -= _2PI;
+    else if (d_unwrapped < -(float)PI) d_unwrapped += _2PI;
+
+    float max_step = 120.0f * dt;
+    if (fabs(d_unwrapped) > max_step) {
+      angle_glitch_count++;
+      return false;   // 保持上一拍角度，等下一次正常采样
+    }
+
     // 圈数检测
-    if(abs(d_angle) > (0.8f*_2PI) ) full_rotations += ( d_angle > 0 ) ? -1 : 1; 
+    if (d_raw > (float)PI) full_rotations -= 1;
+    else if (d_raw < -(float)PI) full_rotations += 1;
+
+    last_sensor_angle = val;
     angle_prev = val;
+    angle_prev_ts = now;
     return true;
+}
+
+uint32_t Sensor_AS5600::getAngleGlitches() const {
+    return angle_glitch_count;
 }
 
 bool Sensor_AS5600::isReady() const {
@@ -164,8 +182,13 @@ float Sensor_AS5600::getVelocity() {
     if(Ts <= 0) Ts = 1e-3f;
     // 速度计算
     float vel = ( (float)(full_rotations - vel_full_rotations)*_2PI + (angle_prev - vel_angle_prev) ) / Ts;    
+    // 兜底：极端情况下（ts异常/残留毛刺）不允许速度尖峰进入速度环
+    if (!isfinite(vel) || fabs(vel) > 120.0f) {
+      vel = last_velocity;
+    } else {
+      last_velocity = vel;
+    }
     // 保存变量以待将来使用
-    last_velocity = vel;
     vel_angle_prev = angle_prev;
     vel_full_rotations = full_rotations;
     vel_angle_prev_ts = angle_prev_ts;

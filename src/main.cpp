@@ -20,11 +20,9 @@ void setup() {
   DFOC_Vbus(12.6);  //设定驱动器供电电压
   DFOC_alignSensor(Motor_PP, Sensor_DIR);
 
-  //速度环 + 电流环参数
-  //60/70 rad/s 时原 0.02/0.1 会在电流上形成明显低频摆动，进而干扰SMO；
-  //适当降低速度环增益，减小电流纹波后再观察SMO效果
-  DFOC_M0_SET_CURRENT_PID(3, 200, 0, 100000);
-  DFOC_M0_SET_VEL_PID(0.01, 0.02, 0, 100000, 6);
+  //速度环 + 电流环参数（回档到 2026/11/7 20:35:32 那一版）
+  DFOC_M0_SET_CURRENT_PID(2.5, 170, 0, 100000);
+  DFOC_M0_SET_VEL_PID(0.008, 0.015, 0, 100000, 6);
 }
 
 int count = 0;

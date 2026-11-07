@@ -122,8 +122,8 @@ void DFOC_M0_SET_CURRENT_PID(float P,float I,float D,float ramp)    //M0电流�
   current_loop_M0.I=I;
   current_loop_M0.D=D;
   current_loop_M0.output_ramp=ramp;
-  //电流环输出是Uq，限幅应与实际可输出电压一致，避免积分饱和
-  current_loop_M0.limit = voltage_power_supply / 2;
+  //电流环输出是Uq，限幅应与SVPWM可输出电压一致（Vbus/sqrt(3)），避免积分饱和
+  current_loop_M0.limit = voltage_power_supply * 0.577350269f;
 }
 
 
@@ -178,7 +178,10 @@ void setPwm(float Ua, float Ub, float Uc) {
 
 // // SPWM六步换向实现
 void setTorque(float Uq,float angle_el) {
-  Uq=_constrain(Uq,-(voltage_power_supply)/2,(voltage_power_supply)/2);
+  //SVPWM：母线电压利用率比正弦PWM高约15%（Vbus/sqrt(3) 而不是 Vbus/2），
+  //80rad/s 这种接近电压极限的工况就靠这15%顶上去
+  const float Umax = voltage_power_supply * 0.577350269f;   // Vbus/sqrt(3)
+  Uq=_constrain(Uq,-Umax,Umax);
   float Ud=0;
   angle_el = _normalizeAngle(angle_el);
   // 帕克逆变换
@@ -189,11 +192,20 @@ void setTorque(float Uq,float angle_el) {
   SMO_Ualpha = Ualpha;
   SMO_Ubeta  = Ubeta;
 
-  // 克拉克逆变换
-  Ua = Ualpha + voltage_power_supply/2;
-  Ub = (sqrt(3)*Ubeta-Ualpha)/2 + voltage_power_supply/2;
-  Uc = (-Ualpha-sqrt(3)*Ubeta)/2 + voltage_power_supply/2;
-  setPwm(Ua,Ub,Uc);
+  // 三相电压（未加零序）
+  float Ua = Ualpha;
+  float Ub = (sqrtf(3.0f)*Ubeta - Ualpha) * 0.5f;
+  float Uc = (-Ualpha - sqrtf(3.0f)*Ubeta) * 0.5f;
+
+  // 零序注入（SVPWM）：把三相电压的中点移到 (max+min)/2，线电压不变，
+  // 但可用幅值从 Vbus/2 提高到 Vbus/sqrt(3)
+  float u_max = fmaxf(Ua, fmaxf(Ub, Uc));
+  float u_min = fminf(Ua, fminf(Ub, Uc));
+  float u_off = -(u_max + u_min) * 0.5f;
+
+  setPwm(Ua + u_off + voltage_power_supply*0.5f,
+         Ub + u_off + voltage_power_supply*0.5f,
+         Uc + u_off + voltage_power_supply*0.5f);
 }
 
 
@@ -450,6 +462,8 @@ float sat(float err, float limits) {
 //归一化锁相环：err≈sin(theta-true_theta)，PI输出电角速度，积分得到电角度
 static float SMO_low_mag_time = 0.0f;   //反电动势幅值持续过低的计时
 static float SMO_bad_phase_time = 0.0f; //PLL相位误差持续过大的计时
+static float SMO_boot_theta_prev = 0.0f; //启动时用E矢量角度差分估算初始速度
+static bool  SMO_boot_theta_init = false;
 
 static void SMO_PLL_update(float Ts) {
   const float wn = 80.0f;       //PLL自然频率 rad/s
@@ -460,9 +474,35 @@ static void SMO_PLL_update(float Ts) {
   float mag2 = Ealpha_flt * Ealpha_flt + Ebeta_flt * Ebeta_flt;
   float mag = sqrtf(mag2);
 
+  //启动引导：PLL还没锁定时，直接用E矢量的角度差分把速度“点亮”。
+  //否则重载时E只有几十mV，低于幅值门限，PLL会一直等到某个电流扰动才启动（表现为跟随很慢）。
+  if (!SMO_PLL_valid) {
+    float th = atan2(-Ealpha_flt, Ebeta_flt);
+    if (!SMO_boot_theta_init) {
+      SMO_boot_theta_prev = th;
+      SMO_boot_theta_init = true;
+    }
+    float dth = th - SMO_boot_theta_prev;
+    if (dth > (float)PI) dth -= _2PI;
+    else if (dth < -(float)PI) dth += _2PI;
+    SMO_boot_theta_prev = th;
+
+    float w_est = dth / (Ts + 1e-6f);
+    if (mag > 0.01f && fabs(w_est) > 50.0f && fabs(w_est) < 2000.0f) {
+      SMO_PLL_theta = th;
+      SMO_PLL_speed = w_est;
+      SMO_PLL_integral = w_est / ki;
+      SMO_PLL_valid = true;
+    }
+  } else {
+    SMO_boot_theta_init = false;   //锁定后重置，下次失锁再重新引导
+  }
+
   //反电动势幅值短暂跌落（电流毛刺、过零点）时不要清零PLL：
-  //保持当前速度继续积分角度，等E恢复后直接续上，避免“掉到0再慢慢爬”
-  if (mag < 0.3f) {
+  //保持当前速度继续积分角度，等E恢复后直接续上，避免“掉到0再慢慢爬”。
+  //注意：阈值不能高。重载时 E = U - Rs*I 会被大电流压得很小（本机80rad/s、0.36A时只有~0.2V），
+  //用0.3会把正常高速段整段挡在PLL外面，表现为SMO一直输出0。
+  if (mag < 0.01f) {
     SMO_low_mag_time += Ts;
     if (SMO_low_mag_time > 0.15f) {     //真的没有反电动势了才缓慢归零
       SMO_PLL_speed *= 0.9f;

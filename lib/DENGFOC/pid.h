@@ -8,6 +8,7 @@ public:
     ~PIDController() = default;
 
     float operator() (float error);
+    void reset();   //清零积分/输出（目标速度大幅变化时用，避免带着旧积分冲过头）
 
     float P; //!< 比例增益(P环增益)
     float I; //!< 积分增益（I环增益）

@@ -14,6 +14,7 @@ class Sensor_AS5600
     bool isReady() const;
     uint32_t getI2CErrors() const;
     uint32_t getI2CFailures() const;
+    uint32_t getAngleGlitches() const;
   private:
     bool readSensorAngle(float& angle);
     int _Mot_Num;
@@ -32,5 +33,6 @@ class Sensor_AS5600
     uint32_t last_retry_ms=0; // 故障后的重试时间
     uint32_t i2c_error_count=0; // I2C事务失败次数（含重试后成功的）
     uint32_t i2c_fail_count=0; // 完全读取失败的采样次数
+    uint32_t angle_glitch_count=0; // 角度跳变（数据毛刺）被丢弃的次数
     TwoWire* wire=nullptr;
 };
